@@ -2,11 +2,22 @@ mod colors;
 
 use clap::{Parser, ValueEnum};
 use colors::Vec3f;
+use serde::{Deserialize, Serialize};
 
-#[derive(Copy, Clone, PartialEq, ValueEnum, Debug)]
+#[derive(Debug, Clone, ValueEnum)]
 pub enum WcagLevel {
     AA,
     AAA,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum Appearance {
+    Darkest,
+    Darker,
+    Dark,
+    Light,
+    Lighter,
+    Lightest,
 }
 
 #[derive(Parser, Debug)]
@@ -14,8 +25,8 @@ pub enum WcagLevel {
 struct Args {
     #[clap(index = 1)]
     image: String,
-    #[clap(index = 2)]
-    output: String,
+    #[clap(long, default_value = "darker")]
+    appearance: Appearance,
     #[clap(long, default_value = "5.0")]
     kappa_1: f32,
     #[clap(long, default_value = "10.0")]
@@ -24,8 +35,35 @@ struct Args {
     tau: f32,
     #[clap(long, default_value = "aaa")]
     wcag_level: WcagLevel,
-    #[clap(long, default_value = "0.1")]
-    background_lightness: f32,
+    #[clap(long, default_value = "0.2")]
+    minimum_chroma: f32,
+    #[clap(long)]
+    debug: bool,
+    #[clap(long)]
+    debug_output: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[allow(non_snake_case)]
+struct Base16Colors {
+    scheme: String,
+    author: String,
+    base00: String,
+    base01: String,
+    base02: String,
+    base03: String,
+    base04: String,
+    base05: String,
+    base06: String,
+    base07: String,
+    base08: String,
+    base09: String,
+    base0A: String,
+    base0B: String,
+    base0C: String,
+    base0D: String,
+    base0E: String,
+    base0F: String,
 }
 
 fn image_to_rgb_data(image: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> Vec<Vec3f> {
@@ -96,6 +134,14 @@ fn circular_weighted_mean(xs: &Vec<f32>, ws: &Vec<f32>) -> f32 {
     }
 }
 
+fn softmax(xs: &Vec<f32>, tau: f32) -> Vec<f32> {
+    let mut ys: Vec<f32> = xs.iter().map(|&x| x / tau).collect();
+    let max = ys.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+    let sum: f32 = ys.iter().map(|&x| (x - max).exp()).sum();
+    ys = ys.iter().map(|&x| (x - max).exp() / sum).collect();
+    ys
+}
+
 fn weighted_softmax(xs: &Vec<f32>, ws: &Vec<f32>, tau: f32) -> Vec<f32> {
     let mut ys: Vec<f32> = xs
         .iter()
@@ -141,7 +187,12 @@ fn get_secondary_hue(primary_hue: f32, hues: &Vec<f32>, chromas: &Vec<f32>, kapp
     let ws = get_chroma_weights(primary_hue, hues, chromas, kappa);
     let mean = circular_weighted_mean(&xs, &ws);
     let secondary_hue = radian_to_degree(mean);
-    secondary_hue
+
+    if (secondary_hue - primary_hue).abs() > 30.0 {
+        primary_hue
+    } else {
+        secondary_hue
+    }
 }
 
 fn get_dark_secondary_hsl(
@@ -151,12 +202,15 @@ fn get_dark_secondary_hsl(
     chromas: &Vec<f32>,
     kappa: f32,
     tau: f32,
+    minimum_chroma: f32,
 ) -> Vec3f {
     let chroma_weights = get_chroma_weights(secondary_hue, hues, chromas, kappa);
     let ws = weighted_softmax(&lightnesses, &chroma_weights, tau);
 
-    let chroma = weighted_mean(chromas, &ws);
-    let lightness = weighted_mean(lightnesses, &ws);
+    let chroma = weighted_mean(chromas, &ws).max(minimum_chroma);
+    let lightness = weighted_mean(lightnesses, &ws)
+        .max(minimum_chroma / 2.0)
+        .min(1.0 - minimum_chroma / 2.0);
     let saturation = get_saturation_from_chroma(chroma, lightness);
     (secondary_hue, saturation, lightness)
 }
@@ -168,13 +222,16 @@ fn get_light_secondary_hsl(
     chromas: &Vec<f32>,
     kappa: f32,
     tau: f32,
+    minimum_chroma: f32,
 ) -> Vec3f {
     let chroma_weights = get_chroma_weights(secondary_hue, hues, chromas, kappa);
     let darknesses = lightnesses.iter().map(|&l| 1.0 - l).collect();
     let ws = weighted_softmax(&darknesses, &chroma_weights, tau);
 
-    let chroma = weighted_mean(chromas, &ws);
-    let lightness = weighted_mean(lightnesses, &ws);
+    let chroma = weighted_mean(chromas, &ws).max(minimum_chroma);
+    let lightness = weighted_mean(lightnesses, &ws)
+        .max(minimum_chroma / 2.0)
+        .min(1.0 - minimum_chroma / 2.0);
     let saturation = get_saturation_from_chroma(chroma, lightness);
     (secondary_hue, saturation, lightness)
 }
@@ -210,12 +267,15 @@ fn find_color_satisfying_wcag_contrast_ratio(
     foreground: Vec3f,
     background: Vec3f,
     target_contrast_ratio: f32,
+    minimum_chroma: f32,
+    lightmode: bool,
 ) -> Vec3f {
-    let background_luminance = colors::rgb_to_relative_luminance(background);
-    let extreme_foreground = if background_luminance < 0.5 {
-        (1.0, 1.0, 1.0)
+    let hsl = colors::get_hsl(foreground);
+
+    let extreme_foreground = if lightmode {
+        colors::get_color_from_hsl((hsl.0, 1.0, minimum_chroma / 2.0))
     } else {
-        (0.0, 0.0, 0.0)
+        colors::get_color_from_hsl((hsl.0, 1.0, 1.0 - minimum_chroma / 2.0))
     };
     let f = |t: f32| {
         let color = colors::mix(foreground, extreme_foreground, t);
@@ -227,142 +287,125 @@ fn find_color_satisfying_wcag_contrast_ratio(
     color
 }
 
-fn main() {
-    let args = Args::parse();
-    let image_path = args.image;
-    let output_path = args.output;
-    let kappa_1 = args.kappa_1;
-    let kappa_2 = args.kappa_2;
-    let tau = args.tau;
-    let target_contrast_ratio = if args.wcag_level == WcagLevel::AA {
-        4.5
-    } else {
-        7.0
-    };
-    let background_lightness = args.background_lightness;
+fn dither(x: u32, y: u32, ws: &Vec<f32>, order: u8) -> usize {
+    // sum w = .3333333(4)
+    //  w[0] = .2000000
+    //  w[1] = .1333333
 
-    let get_secondary_hsl = if background_lightness < 0.5 {
-        get_dark_secondary_hsl
-    } else {
-        get_light_secondary_hsl
-    };
+    let mut x = x;
+    let mut y = y;
+    let mut ws = ws.clone();
+    ws.truncate(ws.len() - 1);
 
-    dbg!("Reading image...");
-    let (width, height) = (1024, 1024);
-    let image = image::ImageReader::open(image_path)
-        .unwrap()
-        .decode()
-        .unwrap()
-        .resize(width, height, image::imageops::FilterType::Nearest)
-        .to_rgb8();
-    let (width, height) = image.dimensions();
+    for _ in 0..order {
+        ws = ws.iter().map(|x| x * 4.0).collect();
+        let ns: Vec<u32> = ws.clone().iter().map(|x| x.floor() as u32).collect();
+        ws = ws.iter().map(|x| x.fract()).collect();
 
-    dbg!("Generating palette...");
-    let rgb_data = image_to_rgb_data(&image);
+        let cell_index = match (x % 2, y % 2) {
+            (0, 0) => 0,
+            (1, 1) => 1,
+            (0, 1) => 2,
+            (1, 0) => 3,
+            _ => panic!(),
+        };
 
-    let average_color = {
-        let color_sum = rgb_data.iter().fold((0.0, 0.0, 0.0), |acc, &rgb| {
-            let rgb = colors::gamma_correct_decode_rgb(rgb);
-            (acc.0 + rgb.0, acc.1 + rgb.1, acc.2 + rgb.2)
+        let mut m = 0;
+        for (i, n) in ns.iter().enumerate() {
+            m += n;
+            if m > cell_index {
+                return i;
+            }
+        }
+        if cell_index != 3 {
+            break;
+        }
+        x = x / 2;
+        y = y / 2;
+    }
+    ws.len()
+}
+
+fn color_to_weights(x: Vec3f, basis: &Vec<Vec3f>) -> Vec<f32> {
+    let x_luminance = colors::get_relative_luminance(x);
+    let basis_luminance: Vec<f32> = basis
+        .iter()
+        .map(|x| colors::get_relative_luminance(*x))
+        .collect();
+
+    let x_hue = colors::get_hsl(x).0;
+    let basis_hues: Vec<f32> = basis.iter().map(|x| colors::get_hsl(*x).0).collect();
+    let (left, right) = {
+        let deltas = basis_hues.iter().map(|hue| {
+            let delta = hue - x_hue;
+            if delta < 0.0 {
+                delta + 360.0
+            } else {
+                delta
+            }
         });
-        let n = rgb_data.len() as f32;
-        colors::gamma_correct_encode_rgb((color_sum.0 / n, color_sum.1 / n, color_sum.2 / n))
+        (
+            deltas
+                .clone()
+                .enumerate()
+                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
+                .unwrap()
+                .0,
+            deltas
+                .clone()
+                .enumerate()
+                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
+                .unwrap()
+                .0,
+        )
     };
-    let background_hsl = colors::rgb_to_hsl(average_color);
-    let background_color = {
-        let (hue, saturation, _) = background_hsl;
-        colors::hsl_to_rgb((hue, saturation, background_lightness))
+
+    let (left_weight, right_weight) = {
+        let (left_weight, right_weight) = (x_hue - basis_hues[left], basis_hues[right] - x_hue);
+        let sum = left_weight + right_weight;
+        (left_weight / sum, right_weight / sum)
     };
 
-    let hsl_data: Vec<Vec3f> = rgb_data
-        .iter()
-        .map(|&rgb| colors::rgb_to_hsl(rgb))
-        .collect();
+    let average_luminance =
+        left_weight * basis_luminance[left] + right_weight * basis_luminance[right];
 
-    let hues: Vec<f32> = hsl_data.iter().map(|&(h, _, _)| h).collect();
-    let lightnesses: Vec<f32> = hsl_data.iter().map(|&(_, _, l)| l).collect();
-    let chromas: Vec<f32> = hsl_data
-        .iter()
-        .map(|hsl| get_chroma_from_hsl(hsl))
-        .collect();
-
-    // R, G, Y, B, M, C
-    let primary_hues: Vec<f32> = vec![0.0, 120.0, 60.0, 240.0, 300.0, 180.0];
-    let secondary_hues: Vec<f32> = primary_hues
-        .iter()
-        .map(|&hue| get_secondary_hue(hue, &hues, &chromas, kappa_1))
-        .collect();
-
-    let primary_hsls: Vec<Vec3f> = primary_hues.iter().map(|&hue| (hue, 1.0, 0.5)).collect();
-    let secondary_hsls: Vec<Vec3f> = secondary_hues
-        .iter()
-        .map(|&hue| get_secondary_hsl(hue, &hues, &lightnesses, &chromas, kappa_2, tau))
-        .collect();
-
-    let primary_colors: Vec<Vec3f> = primary_hsls
-        .iter()
-        .map(|&hsl: &Vec3f| colors::hsl_to_rgb(hsl))
-        .collect();
-    let secondary_colors: Vec<Vec3f> = secondary_hsls
-        .iter()
-        .map(|&hsl: &Vec3f| colors::hsl_to_rgb(hsl))
-        .collect();
-    let third_colors: Vec<Vec3f> = secondary_colors
-        .iter()
-        .map(|&color: &Vec3f| {
-            find_color_satisfying_wcag_contrast_ratio(
-                color,
-                background_color,
-                target_contrast_ratio,
-            )
-        })
-        .collect();
-
-    let dark_black: Vec3f = (0.0, 0.0, 0.0);
-    let bright_black: Vec3f = {
-        let (hue, saturation, _) = background_hsl;
-        let f = |t: f32| {
-            let color = colors::hsl_to_rgb((hue, saturation, t));
-            let relative_luminance = colors::rgb_to_relative_luminance(color);
-            relative_luminance > 0.25
-        };
-        let lightness = binary_search(0.0, 1.0, f);
-        dbg!(lightness);
-        colors::hsl_to_rgb((hue, saturation, lightness))
+    let (black_weight, white_weight) = {
+        if x_luminance > average_luminance {
+            let white_luminance = (x_luminance - average_luminance) / (1.0 - average_luminance);
+            (0.0, white_luminance)
+        } else {
+            let black_luminance = (average_luminance - x_luminance) / average_luminance;
+            (black_luminance, 0.0)
+        }
     };
-    let dark_white: Vec3f = {
-        let (hue, saturation, _) = background_hsl;
-        let f = |t: f32| {
-            let color = colors::hsl_to_rgb((hue, saturation, t));
-            let relative_luminance = colors::rgb_to_relative_luminance(color);
-            dbg!(relative_luminance);
-            relative_luminance > 0.50
-        };
-        let lightness = binary_search(0.0, 1.0, f);
-        dbg!(lightness);
-        colors::hsl_to_rgb((hue, saturation, lightness))
+
+    let (left_weight, right_weight) = {
+        let weight = 1.0 - black_weight - white_weight;
+        (left_weight * weight, right_weight * weight)
     };
-    let bright_white: Vec3f = (1.0, 1.0, 1.0);
 
-    let dark_colors = &third_colors;
-    let bright_colors: Vec<Vec3f> = dark_colors
-        .iter()
-        .map(|&color: &Vec3f| {
-            let (hue, saturation, lightness) = colors::rgb_to_hsl(color);
-            let mut lightness = colors::gamma_correct_decode(lightness);
-            lightness = colors::gamma_correct_encode(lightness + 0.1);
-            colors::hsl_to_rgb((hue, saturation, lightness))
-        })
-        .collect();
+    let mut weights = vec![0.0; basis.len() + 2];
+    let len = weights.len();
+    weights[left] = left_weight;
+    weights[right] = right_weight;
+    weights[len - 2] = black_weight;
+    weights[len - 1] = white_weight;
+    weights
+}
 
-    dbg!(&primary_hues);
-    dbg!(&secondary_hues);
+fn set_gamma_correction_encoded_luminance(color: Vec3f, luminance: f32) -> Vec3f {
+    let (hue, saturation, _) = colors::get_hsl(color);
+    let luminance = colors::gamma_correction_decode(luminance);
+    let lightness = colors::find_lightness_for_target_luminance(hue, saturation, luminance);
+    colors::get_color_from_hsl((hue, saturation, lightness))
+}
 
-    dbg!(&primary_colors);
-    dbg!(&secondary_colors);
-    dbg!(&third_colors);
+fn get_debug_image(image: &image::RgbImage, palette: &Vec<Vec<Vec3f>>) -> image::RgbImage {
+    let (width, height) = image.dimensions();
+    let palette_height = 128;
 
-    let palette_height = width / primary_colors.len() as u32;
+    let rows = palette.len() as u8;
+
     let output_width = width;
     let output_height = height + palette_height;
     let output_image = image::ImageBuffer::from_fn(output_width, output_height, |x, y| {
@@ -375,37 +418,318 @@ fn main() {
         let x = x as f32 / output_width as f32;
         let y = (y - height) as f32 / palette_height as f32;
 
-        let rows = 2;
-        let columns = primary_hues.len() + 2;
-
         let row = (y * rows as f32) as u8;
+        let columns = palette[row as usize].len() as u8;
         let column = (x * columns as f32) as u8;
 
-        let sx = (x - column as f32 / columns as f32) * columns as f32;
-        let sy = (y - row as f32 / rows as f32) * rows as f32;
-
-        let (black, colors, white): (Vec3f, &Vec<Vec3f>, Vec3f) = match row {
-            0 => (dark_black, &dark_colors, dark_white),
-            1 => (bright_black, &bright_colors, bright_white),
-            _ => panic!(),
-        };
-        let foreground_color = match column {
-            0 => black,
-            1..=6 => colors[(column - 1) as usize],
-            7 => white,
-            _ => panic!(),
-        };
-
-        let rgb = if 0.2 < sx && sx < 0.8 && 0.2 < sy && sy < 0.8 {
-            foreground_color
-        } else {
-            background_color
-        };
+        let color = palette[row as usize][column as usize];
         image::Rgb([
-            (rgb.0 * 255.0) as u8,
-            (rgb.1 * 255.0) as u8,
-            (rgb.2 * 255.0) as u8,
+            (color.0 * 255.0) as u8,
+            (color.1 * 255.0) as u8,
+            (color.2 * 255.0) as u8,
         ])
     });
-    output_image.save(output_path).unwrap();
+    output_image
+}
+
+fn hue_to_color(
+    primary_hue: f32,
+    hues: &Vec<f32>,
+    lightnesses: &Vec<f32>,
+    chromas: &Vec<f32>,
+    tau: f32,
+    kappa_1: f32,
+    kappa_2: f32,
+    target_contrast_ratio: f32,
+    minimum_chroma: f32,
+    background_color: Vec3f,
+    lightmode: bool,
+) -> Vec3f {
+    let get_secondary_hsl = if lightmode {
+        get_dark_secondary_hsl
+    } else {
+        get_light_secondary_hsl
+    };
+
+    let secondary_hue = get_secondary_hue(primary_hue, &hues, &chromas, kappa_1);
+    let secondary_hsl = get_secondary_hsl(
+        secondary_hue,
+        &hues,
+        &lightnesses,
+        &chromas,
+        kappa_2,
+        tau,
+        minimum_chroma,
+    );
+    let secondary_color = colors::get_color_from_hsl(secondary_hsl);
+    let third_color = find_color_satisfying_wcag_contrast_ratio(
+        secondary_color,
+        background_color,
+        target_contrast_ratio,
+        minimum_chroma,
+        lightmode,
+    );
+    third_color
+}
+
+fn linspace(start: f32, end: f32, n: u32) -> Vec<f32> {
+    let step = (end - start) / (n - 1) as f32;
+    (0..n).map(|i| start + step * i as f32).collect()
+}
+
+fn main() {
+    let args = Args::parse();
+    let kappa_1 = args.kappa_1;
+    let kappa_2 = args.kappa_2;
+    let tau = args.tau;
+    let target_contrast_ratio = match args.wcag_level {
+        WcagLevel::AA => 4.5,
+        WcagLevel::AAA => 7.0,
+    };
+    let minimum_chroma = args.minimum_chroma;
+    let appearance = args.appearance;
+
+    let lightmode = match appearance {
+        Appearance::Darkest | Appearance::Darker | Appearance::Dark => false,
+        Appearance::Light | Appearance::Lighter | Appearance::Lightest => true,
+    };
+
+    let shade_luminances = match appearance {
+        Appearance::Darkest => vec![linspace(0.0, 0.9, 6), vec![0.95, 1.0]].concat(),
+        Appearance::Darker => vec![linspace(0.1, 0.9, 6), vec![0.95, 1.0]].concat(),
+        Appearance::Dark => vec![linspace(0.2, 0.9, 6), vec![0.95, 1.0]].concat(),
+
+        Appearance::Light => vec![linspace(0.8, 0.1, 6), vec![0.05, 0.0]].concat(),
+        Appearance::Lighter => vec![linspace(0.9, 0.1, 6), vec![0.05, 0.0]].concat(),
+        Appearance::Lightest => vec![linspace(1.0, 0.1, 6), vec![0.05, 0.0]].concat(),
+    };
+
+    let (width, height) = (1024, 1024);
+    let image = image::ImageReader::open(&args.image)
+        .unwrap()
+        .decode()
+        .unwrap()
+        .resize(width, height, image::imageops::FilterType::Lanczos3)
+        .to_rgb8();
+
+    let rgb_data = image_to_rgb_data(&image);
+
+    let average_color = {
+        let color_sum = rgb_data.iter().fold((0.0, 0.0, 0.0), |acc, &rgb| {
+            let rgb = colors::gamma_correction_decode_rgb(rgb);
+            (acc.0 + rgb.0, acc.1 + rgb.1, acc.2 + rgb.2)
+        });
+        let n = rgb_data.len() as f32;
+        colors::gamma_correction_encode_rgb((color_sum.0 / n, color_sum.1 / n, color_sum.2 / n))
+    };
+
+    let shade_colors: Vec<Vec3f> = shade_luminances
+        .iter()
+        .map(|&luminance| set_gamma_correction_encoded_luminance(average_color, luminance))
+        .collect();
+
+    let background_color = shade_colors[0];
+    let foreground_color = shade_colors[5];
+    let (dark_black, bright_black, dark_white, bright_white) = if lightmode {
+        (
+            shade_colors[7],
+            foreground_color,
+            shade_colors[3],
+            background_color,
+        )
+    } else {
+        (
+            background_color,
+            shade_colors[3],
+            foreground_color,
+            shade_colors[7],
+        )
+    };
+
+    let hsl_data: Vec<Vec3f> = rgb_data.iter().map(|&rgb| colors::get_hsl(rgb)).collect();
+    let hues: Vec<f32> = hsl_data.iter().map(|&(h, _, _)| h).collect();
+    let lightnesses: Vec<f32> = hsl_data.iter().map(|&(_, _, l)| l).collect();
+    let chromas: Vec<f32> = hsl_data
+        .iter()
+        .map(|hsl| get_chroma_from_hsl(hsl))
+        .collect();
+
+    // R, G, Y, B, M, C
+    let primary_hues: Vec<f32> = vec![0.0, 120.0, 60.0, 240.0, 300.0, 180.0];
+    let dark_colors: Vec<Vec3f> = primary_hues
+        .iter()
+        .map(|&hue| {
+            hue_to_color(
+                hue,
+                &hues,
+                &lightnesses,
+                &chromas,
+                tau,
+                kappa_1,
+                kappa_2,
+                target_contrast_ratio,
+                minimum_chroma,
+                background_color,
+                lightmode,
+            )
+        })
+        .collect();
+
+    let bright_colors: Vec<Vec3f> = dark_colors
+        .iter()
+        .map(|&color: &Vec3f| {
+            let (hue, saturation, lightness) = colors::get_hsl(color);
+            colors::get_color_from_hsl((hue, saturation, (lightness + 0.1).min(1.0)))
+        })
+        .collect();
+
+    let (dark_red, dark_green, dark_yellow, dark_blue, dark_magenta, dark_cyan) = (
+        dark_colors[0],
+        dark_colors[1],
+        dark_colors[2],
+        dark_colors[3],
+        dark_colors[4],
+        dark_colors[5],
+    );
+    let (bright_red, bright_green, bright_yellow, bright_blue, bright_magenta, bright_cyan) = (
+        bright_colors[0],
+        bright_colors[1],
+        bright_colors[2],
+        bright_colors[3],
+        bright_colors[4],
+        bright_colors[5],
+    );
+
+    // Base16 Special Colors
+    let orange = hue_to_color(
+        40.0,
+        &hues,
+        &lightnesses,
+        &chromas,
+        tau,
+        kappa_1,
+        kappa_2,
+        target_contrast_ratio,
+        minimum_chroma,
+        background_color,
+        lightmode,
+    );
+    let brown_luminance = shade_luminances[3];
+    let brown = set_gamma_correction_encoded_luminance(orange, brown_luminance);
+
+    let base16_colors = Base16Colors {
+        scheme: args.image.clone(),
+        author: "Generated by colorgen".to_string(),
+        base00: colors::get_hex(shade_colors[0]),
+        base01: colors::get_hex(shade_colors[1]),
+        base02: colors::get_hex(shade_colors[2]),
+        base03: colors::get_hex(shade_colors[3]),
+        base04: colors::get_hex(shade_colors[4]),
+        base05: colors::get_hex(shade_colors[5]),
+        base06: colors::get_hex(shade_colors[6]),
+        base07: colors::get_hex(shade_colors[7]),
+        base08: colors::get_hex(dark_red),
+        base09: colors::get_hex(orange),
+        base0A: colors::get_hex(dark_yellow),
+        base0B: colors::get_hex(dark_green),
+        base0C: colors::get_hex(dark_cyan),
+        base0D: colors::get_hex(dark_blue),
+        base0E: colors::get_hex(dark_magenta),
+        base0F: colors::get_hex(brown),
+    };
+
+    println!("{}", serde_yml::to_string(&base16_colors).unwrap());
+
+    if args.debug {
+        let palette = vec![
+            vec![background_color, foreground_color],
+            vec![
+                shade_colors[0],
+                shade_colors[1],
+                shade_colors[2],
+                shade_colors[3],
+                shade_colors[4],
+                shade_colors[5],
+                shade_colors[6],
+                shade_colors[7],
+                dark_red,
+                orange,
+                dark_yellow,
+                dark_green,
+                dark_cyan,
+                dark_blue,
+                dark_magenta,
+                brown,
+            ],
+            vec![
+                dark_black,
+                dark_red,
+                dark_green,
+                dark_yellow,
+                dark_blue,
+                dark_magenta,
+                dark_cyan,
+                dark_white,
+            ],
+            vec![
+                bright_black,
+                bright_red,
+                bright_green,
+                bright_yellow,
+                bright_blue,
+                bright_magenta,
+                bright_cyan,
+                bright_white,
+            ],
+        ];
+        let debug_image = get_debug_image(&image, &palette);
+        let debug_path = match args.debug_output.clone() {
+            Some(path) => path,
+            None => tempfile::Builder::new()
+                .suffix(".png")
+                .keep(true)
+                .tempfile()
+                .unwrap()
+                .into_temp_path()
+                .to_str()
+                .unwrap()
+                .to_string(),
+        };
+        debug_image.save(&debug_path).unwrap();
+        if args.debug_output == None {
+            open::that(&debug_path).unwrap();
+        }
+    }
+
+    //
+    //
+    // let order = 16;
+    // let (width, height) = image.dimensions();
+
+    // let output_image = image::ImageBuffer::from_fn(width, height, |x, y| {
+    //     let pixel = image.get_pixel(x, y);
+    //     let color = {
+    //         let r = pixel[0] as f32 / 255.0;
+    //         let g = pixel[1] as f32 / 255.0;
+    //         let b = pixel[2] as f32 / 255.0;
+    //         (r, g, b)
+    //     };
+
+    //     let ws: Vec<f32> = color_to_weights(color, dark_colors);
+
+    //     let index = dither(x, y, &softmax(&ws, tau), order);
+    //     if index < dark_colors.len() {
+    //         let rgb = dark_colors[index];
+    //         image::Rgb([
+    //             (rgb.0 * 255.0) as u8,
+    //             (rgb.1 * 255.0) as u8,
+    //             (rgb.2 * 255.0) as u8,
+    //         ])
+    //     } else if index == dark_colors.len() {
+    //         image::Rgb([0u8, 0, 0])
+    //     } else {
+    //         image::Rgb([255u8, 255, 255])
+    //     }
+    // });
+    // output_image.save(output_path).unwrap();
 }
