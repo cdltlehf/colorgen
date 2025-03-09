@@ -134,14 +134,6 @@ fn circular_weighted_mean(xs: &Vec<f32>, ws: &Vec<f32>) -> f32 {
     }
 }
 
-fn softmax(xs: &Vec<f32>, tau: f32) -> Vec<f32> {
-    let mut ys: Vec<f32> = xs.iter().map(|&x| x / tau).collect();
-    let max = ys.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-    let sum: f32 = ys.iter().map(|&x| (x - max).exp()).sum();
-    ys = ys.iter().map(|&x| (x - max).exp() / sum).collect();
-    ys
-}
-
 fn weighted_softmax(xs: &Vec<f32>, ws: &Vec<f32>, tau: f32) -> Vec<f32> {
     let mut ys: Vec<f32> = xs
         .iter()
@@ -285,112 +277,6 @@ fn find_color_satisfying_wcag_contrast_ratio(
     let t = binary_search(0.0, 1.0, f);
     let color = colors::mix(foreground, extreme_foreground, t);
     color
-}
-
-fn dither(x: u32, y: u32, ws: &Vec<f32>, order: u8) -> usize {
-    // sum w = .3333333(4)
-    //  w[0] = .2000000
-    //  w[1] = .1333333
-
-    let mut x = x;
-    let mut y = y;
-    let mut ws = ws.clone();
-    ws.truncate(ws.len() - 1);
-
-    for _ in 0..order {
-        ws = ws.iter().map(|x| x * 4.0).collect();
-        let ns: Vec<u32> = ws.clone().iter().map(|x| x.floor() as u32).collect();
-        ws = ws.iter().map(|x| x.fract()).collect();
-
-        let cell_index = match (x % 2, y % 2) {
-            (0, 0) => 0,
-            (1, 1) => 1,
-            (0, 1) => 2,
-            (1, 0) => 3,
-            _ => panic!(),
-        };
-
-        let mut m = 0;
-        for (i, n) in ns.iter().enumerate() {
-            m += n;
-            if m > cell_index {
-                return i;
-            }
-        }
-        if cell_index != 3 {
-            break;
-        }
-        x = x / 2;
-        y = y / 2;
-    }
-    ws.len()
-}
-
-fn color_to_weights(x: Vec3f, basis: &Vec<Vec3f>) -> Vec<f32> {
-    let x_luminance = colors::get_relative_luminance(x);
-    let basis_luminance: Vec<f32> = basis
-        .iter()
-        .map(|x| colors::get_relative_luminance(*x))
-        .collect();
-
-    let x_hue = colors::get_hsl(x).0;
-    let basis_hues: Vec<f32> = basis.iter().map(|x| colors::get_hsl(*x).0).collect();
-    let (left, right) = {
-        let deltas = basis_hues.iter().map(|hue| {
-            let delta = hue - x_hue;
-            if delta < 0.0 {
-                delta + 360.0
-            } else {
-                delta
-            }
-        });
-        (
-            deltas
-                .clone()
-                .enumerate()
-                .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
-                .unwrap()
-                .0,
-            deltas
-                .clone()
-                .enumerate()
-                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
-                .unwrap()
-                .0,
-        )
-    };
-
-    let (left_weight, right_weight) = {
-        let (left_weight, right_weight) = (x_hue - basis_hues[left], basis_hues[right] - x_hue);
-        let sum = left_weight + right_weight;
-        (left_weight / sum, right_weight / sum)
-    };
-
-    let average_luminance =
-        left_weight * basis_luminance[left] + right_weight * basis_luminance[right];
-
-    let (black_weight, white_weight) = {
-        if x_luminance > average_luminance {
-            let white_luminance = (x_luminance - average_luminance) / (1.0 - average_luminance);
-            (0.0, white_luminance)
-        } else {
-            let black_luminance = (average_luminance - x_luminance) / average_luminance;
-            (black_luminance, 0.0)
-        }
-    };
-
-    let (left_weight, right_weight) = {
-        let weight = 1.0 - black_weight - white_weight;
-        (left_weight * weight, right_weight * weight)
-    };
-
-    let mut weights = vec![0.0; basis.len() + 2];
-    let len = weights.len();
-    weights[left] = left_weight;
-    weights[right] = right_weight;
-    weights[len - 2] = black_weight;
-    weights[len - 1] = white_weight;
-    weights
 }
 
 fn set_gamma_correction_encoded_luminance(color: Vec3f, luminance: f32) -> Vec3f {
@@ -700,36 +586,4 @@ fn main() {
             open::that(&debug_path).unwrap();
         }
     }
-
-    //
-    //
-    // let order = 16;
-    // let (width, height) = image.dimensions();
-
-    // let output_image = image::ImageBuffer::from_fn(width, height, |x, y| {
-    //     let pixel = image.get_pixel(x, y);
-    //     let color = {
-    //         let r = pixel[0] as f32 / 255.0;
-    //         let g = pixel[1] as f32 / 255.0;
-    //         let b = pixel[2] as f32 / 255.0;
-    //         (r, g, b)
-    //     };
-
-    //     let ws: Vec<f32> = color_to_weights(color, dark_colors);
-
-    //     let index = dither(x, y, &softmax(&ws, tau), order);
-    //     if index < dark_colors.len() {
-    //         let rgb = dark_colors[index];
-    //         image::Rgb([
-    //             (rgb.0 * 255.0) as u8,
-    //             (rgb.1 * 255.0) as u8,
-    //             (rgb.2 * 255.0) as u8,
-    //         ])
-    //     } else if index == dark_colors.len() {
-    //         image::Rgb([0u8, 0, 0])
-    //     } else {
-    //         image::Rgb([255u8, 255, 255])
-    //     }
-    // });
-    // output_image.save(output_path).unwrap();
 }
