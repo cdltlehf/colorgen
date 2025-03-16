@@ -44,7 +44,7 @@ struct Args {
     maximum_background_chroma: f32,
     #[clap(long)]
     debug: bool,
-    #[clap(long)]
+    #[clap(long, requires = "debug")]
     debug_output: Option<String>,
 }
 
