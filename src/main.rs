@@ -23,6 +23,7 @@ pub enum Appearance {
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
+#[clap(group = clap::ArgGroup::new("image").arg("image").arg("stdin").required(true))]
 struct Args {
     #[clap(index = 1, conflicts_with = "stdin")]
     image: Option<String>,
@@ -406,10 +407,12 @@ fn main() {
             .with_guessed_format()
             .unwrap()
             .decode()
-    } else {
+    } else if args.image.is_some() {
         image::ImageReader::open(&args.image.clone().unwrap())
             .unwrap()
             .decode()
+    } else {
+        panic!("No image provided");
     }
     .unwrap()
     .resize(width, height, image::imageops::FilterType::Lanczos3)
