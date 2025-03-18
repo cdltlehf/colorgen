@@ -29,10 +29,17 @@ struct Args {
     image: FileOrStdin,
     #[clap(long, default_value = "darker")]
     appearance: Appearance,
+    /// Kappa parameter of the von Mises distribution for hue. The higher the value, the more
+    /// weight will be given to hues concentrated around the primary hues: 0, 30 (orange), 60, 120,
+    /// 180, 240, 300
     #[clap(long, default_value = "5.0")]
     kappa_1: f32,
+    /// Kappa parameter of the von Mises distribution for saturation and lightness. The higher the value, the more weight will be
+    /// given to the saturation and lightness of colors with similar hue.
     #[clap(long, default_value = "10.0")]
     kappa_2: f32,
+    /// Tau parameter for the softmax function. The higher the value, the more uniform the weights
+    /// will be.
     #[clap(long, default_value = "0.05")]
     tau: f32,
     #[clap(long, default_value = "aaa")]
