@@ -3,6 +3,7 @@ mod colors;
 use clap::{Parser, ValueEnum};
 use clap_stdin::FileOrStdin;
 use colors::Vec3f;
+use itertools::izip;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
@@ -48,10 +49,18 @@ struct Args {
     minimum_chroma: f32,
     #[clap(long, default_value = "0.2")]
     maximum_background_chroma: f32,
+    #[clap(long, default_value = "30.0")]
+    hue_difference_threshold: f32,
+    /// Do not use the saturation and lightness of the dominant color in the image if the extracted hue is
+    /// too far from the source hue.
+    #[clap(long)]
+    no_use_dominant_color: bool,
     #[clap(long)]
     debug: bool,
     #[clap(long, requires = "debug")]
     debug_output: Option<String>,
+    #[clap(long)]
+    verbose: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -157,8 +166,8 @@ fn weighted_softmax(xs: &Vec<f32>, ws: &Vec<f32>, tau: f32) -> Vec<f32> {
     ys
 }
 
-fn get_hue_weights(primary_hue: f32, hues: &Vec<f32>, kappa: f32) -> Vec<f32> {
-    let mu = degree_to_radian(primary_hue);
+fn get_hue_weights(source_hue: f32, hues: &Vec<f32>, kappa: f32) -> Vec<f32> {
+    let mu = degree_to_radian(source_hue);
     let von_mises_distribution = get_von_mises_distribution(mu, kappa, 3);
     let ws: Vec<_> = hues
         .iter()
@@ -167,76 +176,59 @@ fn get_hue_weights(primary_hue: f32, hues: &Vec<f32>, kappa: f32) -> Vec<f32> {
     ws
 }
 
-fn get_chroma_weights(
-    primary_hue: f32,
+fn extract_hue_and_weight(
+    source_hue: f32,
     hues: &Vec<f32>,
     chromas: &Vec<f32>,
     kappa: f32,
-) -> Vec<f32> {
-    let hue_weights = get_hue_weights(primary_hue, hues, kappa);
+) -> (f32, f32) {
+    let xs: Vec<_> = hues
+        .iter()
+        .map(|&degree: &f32| degree_to_radian(degree))
+        .collect();
+    let hue_weights = get_hue_weights(source_hue, hues, kappa);
     let ws = hue_weights
         .iter()
         .zip(chromas.iter())
         .map(|(&w, &chroma)| w * chroma)
         .collect();
-    ws
-}
-
-fn get_secondary_hue(primary_hue: f32, hues: &Vec<f32>, chromas: &Vec<f32>, kappa: f32) -> f32 {
-    let xs: Vec<_> = hues
-        .iter()
-        .map(|&degree: &f32| degree_to_radian(degree))
-        .collect();
-    let ws = get_chroma_weights(primary_hue, hues, chromas, kappa);
     let mean = circular_weighted_mean(&xs, &ws);
-    let secondary_hue = radian_to_degree(mean);
+    let total_weight = hue_weights.iter().sum();
+    let extracted_hue = radian_to_degree(mean);
+    (extracted_hue, total_weight)
+}
 
-    if (secondary_hue - primary_hue).abs() > 30.0 {
-        primary_hue
+fn extract_hsl(
+    extracted_hue: f32,
+    hues: &Vec<f32>,
+    lightnesses: &Vec<f32>,
+    chromas: &Vec<f32>,
+    kappa: f32,
+    tau: f32,
+    minimum_chroma: f32,
+    lightmode: bool,
+) -> Vec3f {
+    let hue_and_chroma_weights = {
+        let hue_weights = get_hue_weights(extracted_hue, hues, kappa);
+        hue_weights
+            .iter()
+            .zip(chromas)
+            .map(|(&w, &chroma)| w * chroma)
+            .collect()
+    };
+    let ws = if lightmode {
+        let darknesses = lightnesses.iter().map(|&l| 1.0 - l).collect();
+        weighted_softmax(&darknesses, &hue_and_chroma_weights, tau)
     } else {
-        secondary_hue
-    }
-}
-
-fn get_dark_secondary_hsl(
-    secondary_hue: f32,
-    hues: &Vec<f32>,
-    lightnesses: &Vec<f32>,
-    chromas: &Vec<f32>,
-    kappa: f32,
-    tau: f32,
-    minimum_chroma: f32,
-) -> Vec3f {
-    let chroma_weights = get_chroma_weights(secondary_hue, hues, chromas, kappa);
-    let ws = weighted_softmax(&lightnesses, &chroma_weights, tau);
+        weighted_softmax(&lightnesses, &hue_and_chroma_weights, tau)
+    };
 
     let chroma = weighted_mean(chromas, &ws).max(minimum_chroma);
     let lightness = weighted_mean(lightnesses, &ws)
         .max(minimum_chroma / 2.0)
         .min(1.0 - minimum_chroma / 2.0);
     let saturation = get_saturation_from_chroma(chroma, lightness);
-    (secondary_hue, saturation, lightness)
-}
-
-fn get_light_secondary_hsl(
-    secondary_hue: f32,
-    hues: &Vec<f32>,
-    lightnesses: &Vec<f32>,
-    chromas: &Vec<f32>,
-    kappa: f32,
-    tau: f32,
-    minimum_chroma: f32,
-) -> Vec3f {
-    let chroma_weights = get_chroma_weights(secondary_hue, hues, chromas, kappa);
-    let darknesses = lightnesses.iter().map(|&l| 1.0 - l).collect();
-    let ws = weighted_softmax(&darknesses, &chroma_weights, tau);
-
-    let chroma = weighted_mean(chromas, &ws).max(minimum_chroma);
-    let lightness = weighted_mean(lightnesses, &ws)
-        .max(minimum_chroma / 2.0)
-        .min(1.0 - minimum_chroma / 2.0);
-    let saturation = get_saturation_from_chroma(chroma, lightness);
-    (secondary_hue, saturation, lightness)
+    (extracted_hue, saturation, lightness)
 }
 
 fn get_chroma_from_hsl(hsl: &Vec3f) -> f32 {
@@ -329,46 +321,6 @@ fn get_debug_image(image: &image::RgbImage, palette: &Vec<Vec<Vec3f>>) -> image:
     output_image
 }
 
-fn hue_to_color(
-    primary_hue: f32,
-    hues: &Vec<f32>,
-    lightnesses: &Vec<f32>,
-    chromas: &Vec<f32>,
-    tau: f32,
-    kappa_1: f32,
-    kappa_2: f32,
-    target_contrast_ratio: f32,
-    minimum_chroma: f32,
-    background_color: Vec3f,
-    lightmode: bool,
-) -> Vec3f {
-    let get_secondary_hsl = if lightmode {
-        get_dark_secondary_hsl
-    } else {
-        get_light_secondary_hsl
-    };
-
-    let secondary_hue = get_secondary_hue(primary_hue, &hues, &chromas, kappa_1);
-    let secondary_hsl = get_secondary_hsl(
-        secondary_hue,
-        &hues,
-        &lightnesses,
-        &chromas,
-        kappa_2,
-        tau,
-        minimum_chroma,
-    );
-    let secondary_color = colors::get_color_from_hsl(secondary_hsl);
-    let third_color = find_color_satisfying_wcag_contrast_ratio(
-        secondary_color,
-        background_color,
-        target_contrast_ratio,
-        minimum_chroma,
-        lightmode,
-    );
-    third_color
-}
-
 fn linspace(start: f32, end: f32, n: u32) -> Vec<f32> {
     let step = (end - start) / (n - 1) as f32;
     (0..n).map(|i| start + step * i as f32).collect()
@@ -386,6 +338,7 @@ fn main() {
     let minimum_chroma = args.minimum_chroma;
     let maximum_background_chroma = args.maximum_background_chroma;
     let appearance = args.appearance;
+    let use_dominant_color = !args.no_use_dominant_color;
 
     let lightmode = match appearance {
         Appearance::Darkest | Appearance::Darker | Appearance::Dark => false,
@@ -427,20 +380,16 @@ fn main() {
         colors::gamma_correction_encode_rgb((color_sum.0 / n, color_sum.1 / n, color_sum.2 / n))
     };
 
-    let shade_colors: Vec<Vec3f> = shade_luminances
+    let shade_colors: Vec<_> = shade_luminances
         .iter()
         .map(|&luminance| {
-            set_gamma_correction_encoded_luminance(
-                {
-                    let (hue, saturation, lightness) = colors::get_hsl(average_color);
-                    let saturation = saturation.min(get_saturation_from_chroma(
-                        maximum_background_chroma,
-                        lightness,
-                    ));
-                    colors::get_color_from_hsl((hue, saturation, lightness))
-                },
-                luminance,
-            )
+            let (hue, saturation, lightness) = colors::get_hsl(average_color);
+            let saturation = saturation.min(get_saturation_from_chroma(
+                maximum_background_chroma,
+                lightness,
+            ));
+            let color = colors::get_color_from_hsl((hue, saturation, lightness));
+            set_gamma_correction_encoded_luminance(color, luminance)
         })
         .collect();
 
@@ -462,36 +411,117 @@ fn main() {
         )
     };
 
-    let hsl_data: Vec<Vec3f> = rgb_data.iter().map(|&rgb| colors::get_hsl(rgb)).collect();
-    let hues: Vec<f32> = hsl_data.iter().map(|&(h, _, _)| h).collect();
-    let lightnesses: Vec<f32> = hsl_data.iter().map(|&(_, _, l)| l).collect();
-    let chromas: Vec<f32> = hsl_data
+    let hsl_data: Vec<_> = rgb_data.iter().map(|&rgb| colors::get_hsl(rgb)).collect();
+    let hues: Vec<_> = hsl_data.iter().map(|&(h, _, _)| h).collect();
+    let lightnesses: Vec<_> = hsl_data.iter().map(|&(_, _, l)| l).collect();
+    let chromas: Vec<_> = hsl_data
         .iter()
         .map(|hsl| get_chroma_from_hsl(hsl))
         .collect();
 
     // R, G, Y, B, M, C
-    let primary_hues: Vec<f32> = vec![0.0, 120.0, 60.0, 240.0, 300.0, 180.0];
-    let dark_colors: Vec<Vec3f> = primary_hues
+    let source_hues = vec![0.0, 120.0, 60.0, 240.0, 300.0, 180.0];
+    if args.verbose {
+        eprintln!("Source hues: {:?}", source_hues);
+    }
+
+    let (extracted_hues, weights): (Vec<_>, Vec<_>) = source_hues
         .iter()
-        .map(|&hue| {
-            hue_to_color(
-                hue,
-                &hues,
-                &lightnesses,
-                &chromas,
-                tau,
-                kappa_1,
-                kappa_2,
+        .map(|&source_hue| extract_hue_and_weight(source_hue, &hues, &chromas, kappa_1))
+        .unzip();
+    if args.verbose {
+        eprintln!("Extracted hues: {:?}", extracted_hues);
+    }
+
+    let (&dominant_source_hue, &dominant_hue, _) =
+        izip!(source_hues.iter(), extracted_hues.iter(), weights.iter())
+            .max_by(|(_, _, w1), (_, _, w2)| w1.partial_cmp(w2).unwrap())
+            .unwrap();
+    let (dominant_hue, dominant_saturation, dominant_lightness) = extract_hsl(
+        dominant_hue,
+        &hues,
+        &lightnesses,
+        &chromas,
+        kappa_2,
+        tau,
+        minimum_chroma,
+        lightmode,
+    );
+    let dominant_hue_difference =
+        (dominant_hue - dominant_source_hue + 180.0).rem_euclid(360.0) - 180.0;
+    let exists_dominant_hue = dominant_hue_difference.abs() < args.hue_difference_threshold;
+
+    if args.verbose {
+        if exists_dominant_hue {
+            eprintln!("Dominant hue: {}", dominant_hue);
+            eprintln!("Dominant saturation: {}", dominant_saturation);
+            eprintln!("Dominant lightness: {}", dominant_lightness);
+            eprintln!("Dominant hue difference: {}", dominant_hue_difference);
+        } else {
+            eprintln!("Dominant hue does not exist");
+        }
+    }
+
+    let names = vec!["Red", "Green", "Yellow", "Blue", "Magenta", "Cyan"];
+    let dark_colors: Vec<_> = izip!(names.iter(), source_hues.iter(), extracted_hues.iter())
+        .map(|(&name, &source_hue, &extracted_hue)| {
+            let hue_difference = (extracted_hue - source_hue + 180.0).rem_euclid(360.0) - 180.0;
+            if args.verbose {
+                eprintln!("Source {} hue: {}", name, source_hue);
+                eprintln!("Extracted {} hue: {}", name, extracted_hue);
+                eprintln!("Hue difference: {}", hue_difference);
+            }
+            let (refined_hue, use_refined_hue) =
+                if hue_difference.abs() < args.hue_difference_threshold {
+                    (extracted_hue, false)
+                } else {
+                    let refined_hue = (source_hue + dominant_hue_difference).rem_euclid(360.0);
+                    if args.verbose {
+                        eprintln!(
+                            "{} hue difference is larger than the threshold {}.",
+                            name, args.hue_difference_threshold
+                        );
+                        eprintln!(
+                            "Using refined hue {} instead of extracted hue.",
+                            refined_hue
+                        );
+                    }
+                    (refined_hue, true)
+                };
+            if exists_dominant_hue && use_dominant_color && use_refined_hue {
+                if args.verbose {
+                    eprintln!(
+                        "Using dominant saturation {} and lightness {} for {}.",
+                        dominant_saturation, dominant_lightness, name
+                    );
+                }
+                (refined_hue, dominant_saturation, dominant_lightness)
+            } else {
+                extract_hsl(
+                    refined_hue,
+                    &hues,
+                    &lightnesses,
+                    &chromas,
+                    kappa_2,
+                    tau,
+                    minimum_chroma,
+                    lightmode,
+                )
+            }
+        })
+        .map(|hsl| colors::get_color_from_hsl(hsl))
+        .map(|color| {
+            find_color_satisfying_wcag_contrast_ratio(
+                color,
+                background_color,
                 target_contrast_ratio,
                 minimum_chroma,
-                background_color,
                 lightmode,
             )
         })
         .collect();
 
-    let bright_colors: Vec<Vec3f> = dark_colors
+    let bright_colors: Vec<_> = dark_colors
         .iter()
         .map(|&color: &Vec3f| {
             let (hue, saturation, lightness) = colors::get_hsl(color);
@@ -517,19 +547,33 @@ fn main() {
     );
 
     // Base16 Special Colors
-    let orange = hue_to_color(
-        40.0,
-        &hues,
-        &lightnesses,
-        &chromas,
-        tau,
-        kappa_1,
-        kappa_2,
-        target_contrast_ratio,
-        minimum_chroma,
-        background_color,
-        lightmode,
-    );
+    let orange = {
+        let orange_hue = {
+            let red_hue = extracted_hues[0];
+            let yellow_hue = extracted_hues[2];
+            let difference = (yellow_hue - red_hue).rem_euclid(360.0);
+            let orange_hue = (red_hue + difference * 2.0 / 3.0).rem_euclid(360.0);
+            orange_hue
+        };
+        let orange_hsl = extract_hsl(
+            orange_hue,
+            &hues,
+            &lightnesses,
+            &chromas,
+            kappa_2,
+            tau,
+            minimum_chroma,
+            lightmode,
+        );
+        let orange = colors::get_color_from_hsl(orange_hsl);
+        find_color_satisfying_wcag_contrast_ratio(
+            orange,
+            background_color,
+            target_contrast_ratio,
+            minimum_chroma,
+            lightmode,
+        )
+    };
     let brown_luminance = shade_luminances[3];
     let brown = set_gamma_correction_encoded_luminance(orange, brown_luminance);
 
