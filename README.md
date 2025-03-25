@@ -3,7 +3,7 @@
 A color scheme generator for [Base16](https://github.com/chriskempson/base16).
 
 [It is written in rust
-btw](https://www.reddit.com/r/linuxmemes/comments/9xgfxq/why_i_use_arch_btw/).
+btw](https://www.reddit.com/r/linuxmemes/comments/9xgfxq/why_i_use_arch_btw).
 
 ## Screenshots
 
@@ -23,7 +23,7 @@ cargo install --path .
 Usage: colorgen [OPTIONS] <IMAGE>
 
 Arguments:
-  <IMAGE>
+  <IMAGE>  
 
 Options:
       --appearance <APPEARANCE>
@@ -46,10 +46,17 @@ Options:
           [default: 0.2]
       --maximum-background-chroma <MAXIMUM_BACKGROUND_CHROMA>
           [default: 0.2]
+      --hue-difference-threshold <HUE_DIFFERENCE_THRESHOLD>
+          [default: 30.0]
+      --no-use-dominant-color
+          Do not use the saturation and lightness of the dominant color in the
+          image if the extracted hue is too far from the source hue
       --debug
-
+          
       --debug-output <DEBUG_OUTPUT>
-
+          
+      --verbose
+          
   -h, --help
           Print help
   -V, --version
