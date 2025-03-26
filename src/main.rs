@@ -89,8 +89,7 @@ struct Base16Colors {
 fn image_to_rgb_data(image: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> Vec<Vec3f> {
     let rgb_data: Vec<Vec3f> = image
         .pixels()
-        .map(|pixel| {
-            let pixel = *pixel;
+        .map(|&pixel| {
             let r = pixel[0] as f32 / 255.0;
             let g = pixel[1] as f32 / 255.0;
             let b = pixel[2] as f32 / 255.0;
@@ -193,7 +192,7 @@ fn extract_hue_and_weight(
         .map(|(&w, &chroma)| w * chroma)
         .collect();
     let mean = circular_weighted_mean(&xs, &ws);
-    let total_weight = ws.iter().sum();
+    let total_weight = ws.iter().sum::<f32>() / (ws.len() as f32);
     let extracted_hue = radian_to_degree(mean);
     (extracted_hue, total_weight)
 }
@@ -431,6 +430,7 @@ fn main() {
         .unzip();
     if args.verbose {
         eprintln!("Extracted hues: {:?}", extracted_hues);
+        eprintln!("Weights: {:?}", weights);
     }
 
     let (&dominant_source_hue, &dominant_hue, &dominant_weight) =
@@ -465,39 +465,62 @@ fn main() {
     }
 
     let names = vec!["Red", "Green", "Yellow", "Blue", "Magenta", "Cyan"];
-    let (refined_hues, use_refined_hues): (Vec<_>, Vec<_>) =
-        izip!(names.iter(), source_hues.iter(), extracted_hues.iter())
-            .map(|(&name, &source_hue, &extracted_hue)| {
-                let hue_difference = (extracted_hue - source_hue + 180.0).rem_euclid(360.0) - 180.0;
+    let (refined_hues, use_refined_hues): (Vec<_>, Vec<_>) = izip!(
+        names.iter(),
+        source_hues.iter(),
+        extracted_hues.iter(),
+        weights.iter()
+    )
+    .map(|(&name, &source_hue, &extracted_hue, &weight)| {
+        let hue_difference = (extracted_hue - source_hue + 180.0).rem_euclid(360.0) - 180.0;
+        if args.verbose {
+            eprintln!("Source {} hue: {}", name, source_hue);
+            eprintln!("Extracted {} hue: {}", name, extracted_hue);
+            eprintln!("Hue difference: {}", hue_difference);
+        }
+
+        let use_refined_hue = {
+            if hue_difference.abs() < args.hue_difference_threshold {
                 if args.verbose {
-                    eprintln!("Source {} hue: {}", name, source_hue);
-                    eprintln!("Extracted {} hue: {}", name, extracted_hue);
-                    eprintln!("Hue difference: {}", hue_difference);
+                    eprintln!(
+                        "{} hue difference is smaller than the threshold {}.",
+                        name, args.hue_difference_threshold
+                    );
                 }
-                if hue_difference.abs() < args.hue_difference_threshold {
-                    (extracted_hue, false)
+                true
+            } else if weight < minimum_chroma {
+                if args.verbose {
+                    eprintln!(
+                        "{} hue weight is smaller than the minimum chroma {}.",
+                        name, minimum_chroma
+                    );
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        if !use_refined_hue {
+            (extracted_hue, use_refined_hue)
+        } else {
+            let refined_hue = {
+                if exists_dominant_hue {
+                    (source_hue + dominant_hue_difference).rem_euclid(360.0)
                 } else {
-                    let refined_hue = {
-                        if exists_dominant_hue {
-                            (source_hue + dominant_hue_difference).rem_euclid(360.0)
-                        } else {
-                            source_hue
-                        }
-                    };
-                    if args.verbose {
-                        eprintln!(
-                            "{} hue difference is larger than the threshold {}.",
-                            name, args.hue_difference_threshold
-                        );
-                        eprintln!(
-                            "Using refined hue {} instead of extracted hue.",
-                            refined_hue
-                        );
-                    }
-                    (refined_hue, true)
+                    source_hue
                 }
-            })
-            .unzip();
+            };
+            if args.verbose {
+                eprintln!(
+                    "Using refined hue {} instead of extracted hue.",
+                    refined_hue
+                );
+            }
+            (refined_hue, use_refined_hue)
+        }
+    })
+    .unzip();
 
     let dark_colors: Vec<_> = izip!(names.iter(), refined_hues.iter(), use_refined_hues.iter())
         .map(|(&name, &refined_hue, &use_refined_hue)| {
