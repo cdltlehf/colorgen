@@ -15,12 +15,15 @@ pub enum WcagLevel {
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Appearance {
-    Darkest,
-    Darker,
     Dark,
     Light,
-    Lighter,
-    Lightest,
+    Auto,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum BackgroundColorSource {
+    Border,
+    Uniform,
 }
 
 #[derive(Parser, Debug)]
@@ -28,15 +31,15 @@ pub enum Appearance {
 struct Args {
     #[clap(index = 1)]
     image: FileOrStdin,
-    #[clap(long, default_value = "darker")]
-    appearance: Appearance,
+
     /// Kappa parameter of the von Mises distribution for hue. The higher the value, the more
     /// weight will be given to hues concentrated around the primary hues: 0, 30 (orange), 60, 120,
     /// 180, 240, 300
     #[clap(long, default_value = "5.0")]
     kappa_1: f32,
-    /// Kappa parameter of the von Mises distribution for saturation and lightness. The higher the value, the more weight will be
-    /// given to the saturation and lightness of colors with similar hue.
+    /// Kappa parameter of the von Mises distribution for saturation and lightness. The higher the
+    /// value, the more weight will be given to the saturation and lightness of colors with similar
+    /// hue.
     #[clap(long, default_value = "10.0")]
     kappa_2: f32,
     /// Tau parameter for the softmax function. The higher the value, the more uniform the weights
@@ -47,20 +50,33 @@ struct Args {
     wcag_level: WcagLevel,
     #[clap(long, default_value = "0.2")]
     minimum_chroma: f32,
-    #[clap(long, default_value = "0.2")]
-    maximum_background_chroma: f32,
+
     #[clap(long, default_value = "30.0")]
     hue_difference_threshold: f32,
-    /// Do not use the saturation and lightness of the dominant color in the image if the extracted hue is
-    /// too far from the source hue.
+    /// Do not use the saturation and lightness of the dominant color in the image if the extracted
+    /// hue is too far from the source hue.
     #[clap(long)]
     no_use_dominant_color: bool,
+
+    #[clap(long, default_value = "border")]
+    background_color_source: BackgroundColorSource,
+    #[clap(long, default_value = "dark")]
+    appearance: Appearance,
+    #[clap(long, default_value = "0.1")]
+    maximum_dark_background_gamma_encoded_luminance: f32,
+    #[clap(long, default_value = "0.9")]
+    minimum_light_background_gamma_encoded_luminance: f32,
+    #[clap(long, default_value = "0.05")]
+    maximum_dark_background_chroma: f32,
+    #[clap(long, default_value = "0.05")]
+    maximum_light_background_chroma: f32,
+
+    #[clap(long)]
+    verbose: bool,
     #[clap(long)]
     debug: bool,
     #[clap(long, requires = "debug")]
     debug_output: Option<String>,
-    #[clap(long)]
-    verbose: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -215,11 +231,11 @@ fn extract_saturation_and_lightness(
             .map(|(&w, &chroma)| w * chroma)
             .collect()
     };
-    let ws = if lightmode {
+    let ws = if !lightmode {
+        weighted_softmax(&lightnesses, &hue_and_chroma_weights, tau)
+    } else {
         let darknesses = lightnesses.iter().map(|&l| 1.0 - l).collect();
         weighted_softmax(&darknesses, &hue_and_chroma_weights, tau)
-    } else {
-        weighted_softmax(&lightnesses, &hue_and_chroma_weights, tau)
     };
 
     let chroma = weighted_mean(chromas, &ws).max(minimum_chroma);
@@ -266,10 +282,10 @@ fn find_color_satisfying_wcag_contrast_ratio(
 ) -> Vec3f {
     let hsl = colors::get_hsl(foreground);
 
-    let extreme_foreground = if lightmode {
-        colors::get_color_from_hsl((hsl.0, 1.0, minimum_chroma / 2.0))
-    } else {
+    let extreme_foreground = if !lightmode {
         colors::get_color_from_hsl((hsl.0, 1.0, 1.0 - minimum_chroma / 2.0))
+    } else {
+        colors::get_color_from_hsl((hsl.0, 1.0, minimum_chroma / 2.0))
     };
     let f = |t: f32| {
         let color = colors::mix(foreground, extreme_foreground, t);
@@ -281,9 +297,9 @@ fn find_color_satisfying_wcag_contrast_ratio(
     color
 }
 
-fn set_gamma_correction_encoded_luminance(color: Vec3f, luminance: f32) -> Vec3f {
+fn set_gamma_correction_encoded_luminance(color: Vec3f, encoded_luminance: f32) -> Vec3f {
     let (hue, saturation, _) = colors::get_hsl(color);
-    let luminance = colors::gamma_correction_decode(luminance);
+    let luminance = colors::gamma_correction_decode(encoded_luminance);
     let lightness = colors::find_lightness_for_target_luminance(hue, saturation, luminance);
     colors::get_color_from_hsl((hue, saturation, lightness))
 }
@@ -327,32 +343,27 @@ fn linspace(start: f32, end: f32, n: u32) -> Vec<f32> {
 
 fn main() {
     let args = Args::parse();
-    let kappa_1 = args.kappa_1;
-    let kappa_2 = args.kappa_2;
-    let tau = args.tau;
+    let Args {
+        kappa_1,
+        kappa_2,
+        tau,
+        minimum_chroma,
+        maximum_dark_background_chroma,
+        maximum_light_background_chroma,
+        appearance,
+        verbose,
+        background_color_source,
+        hue_difference_threshold,
+        debug_output,
+        maximum_dark_background_gamma_encoded_luminance,
+        minimum_light_background_gamma_encoded_luminance,
+        ..
+    } = args;
     let target_contrast_ratio = match args.wcag_level {
         WcagLevel::AA => 4.5,
         WcagLevel::AAA => 7.0,
     };
-    let minimum_chroma = args.minimum_chroma;
-    let maximum_background_chroma = args.maximum_background_chroma;
-    let appearance = args.appearance;
     let use_dominant_color = !args.no_use_dominant_color;
-
-    let lightmode = match appearance {
-        Appearance::Darkest | Appearance::Darker | Appearance::Dark => false,
-        Appearance::Light | Appearance::Lighter | Appearance::Lightest => true,
-    };
-
-    let shade_luminances = match appearance {
-        Appearance::Darkest => vec![linspace(0.0, 0.9, 6), vec![0.95, 1.0]].concat(),
-        Appearance::Darker => vec![linspace(0.1, 0.9, 6), vec![0.95, 1.0]].concat(),
-        Appearance::Dark => vec![linspace(0.2, 0.9, 6), vec![0.95, 1.0]].concat(),
-
-        Appearance::Light => vec![linspace(0.8, 0.1, 6), vec![0.05, 0.0]].concat(),
-        Appearance::Lighter => vec![linspace(0.9, 0.1, 6), vec![0.05, 0.0]].concat(),
-        Appearance::Lightest => vec![linspace(1.0, 0.1, 6), vec![0.05, 0.0]].concat(),
-    };
 
     let (width, height) = (1024, 1024);
     let image = {
@@ -367,10 +378,37 @@ fn main() {
             .resize(width, height, image::imageops::FilterType::Lanczos3)
             .to_rgb8()
     };
-
     let rgb_data = image_to_rgb_data(&image);
 
     let average_color = {
+        let rgb_data = match background_color_source {
+            BackgroundColorSource::Border => {
+                if verbose {
+                    eprintln!("Using border pixels for the average color.");
+                }
+                &image
+                    .enumerate_pixels()
+                    .map(|(x, y, pixel)| {
+                        if x == 0 || x == width - 1 || y == 0 || y == height - 1 {
+                            let r = pixel[0] as f32 / 255.0;
+                            let g = pixel[1] as f32 / 255.0;
+                            let b = pixel[2] as f32 / 255.0;
+                            Some((r, g, b))
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|x| x.is_some())
+                    .map(|x| x.unwrap())
+                    .collect()
+            }
+            BackgroundColorSource::Uniform => {
+                if verbose {
+                    eprintln!("Using all pixels for the average color.");
+                }
+                &rgb_data
+            }
+        };
         let color_sum = rgb_data.iter().fold((0.0, 0.0, 0.0), |acc, &rgb| {
             let rgb = colors::gamma_correction_decode_rgb(rgb);
             (acc.0 + rgb.0, acc.1 + rgb.1, acc.2 + rgb.2)
@@ -378,8 +416,62 @@ fn main() {
         let n = rgb_data.len() as f32;
         colors::gamma_correction_encode_rgb((color_sum.0 / n, color_sum.1 / n, color_sum.2 / n))
     };
+    if verbose {
+        eprintln!("Average color: {:?}", average_color);
+    }
 
-    let shade_colors: Vec<_> = shade_luminances
+    let background_luminance = colors::get_relative_luminance(average_color);
+    let background_encoded_luminance = colors::gamma_correction_encode(background_luminance);
+    if verbose {
+        eprintln!("Background luminance: {}", background_luminance);
+    }
+    let lightmode = match appearance {
+        Appearance::Dark => false,
+        Appearance::Light => true,
+        Appearance::Auto => background_encoded_luminance > 0.5,
+    };
+
+    let background_luminance = if !lightmode {
+        let maximum_dark_background_luminance =
+            colors::gamma_correction_decode(maximum_dark_background_gamma_encoded_luminance);
+        background_luminance.min(maximum_dark_background_luminance)
+    } else {
+        let minimum_light_background_luminance =
+            colors::gamma_correction_decode(minimum_light_background_gamma_encoded_luminance);
+        background_luminance.max(minimum_light_background_luminance)
+    };
+    let background_encoded_luminance = colors::gamma_correction_encode(background_luminance);
+
+    let comment_luminance = if !lightmode {
+        target_contrast_ratio * (background_luminance + 0.05) - 0.05
+    } else {
+        (background_luminance + 0.05) / target_contrast_ratio - 0.05
+    };
+    let comment_encoded_luminance = colors::gamma_correction_encode(comment_luminance);
+    let shade_encoded_luminances = if !lightmode {
+        vec![
+            linspace(background_encoded_luminance, comment_encoded_luminance, 4),
+            linspace(comment_encoded_luminance, 0.9, 3)[1..].to_vec(),
+            vec![0.95, 1.0],
+        ]
+    } else {
+        vec![
+            linspace(background_encoded_luminance, comment_encoded_luminance, 4),
+            linspace(comment_encoded_luminance, 0.1, 3)[1..].to_vec(),
+            vec![0.05, 0.0],
+        ]
+    }
+    .concat();
+    if verbose {
+        eprintln!("Shade luminance: {:?}", shade_encoded_luminances);
+    }
+
+    let maximum_background_chroma = if !lightmode {
+        maximum_dark_background_chroma
+    } else {
+        maximum_light_background_chroma
+    };
+    let shade_colors: Vec<_> = shade_encoded_luminances
         .iter()
         .map(|&luminance| {
             let (hue, saturation, lightness) = colors::get_hsl(average_color);
@@ -394,19 +486,19 @@ fn main() {
 
     let background_color = shade_colors[0];
     let foreground_color = shade_colors[5];
-    let (dark_black, bright_black, dark_white, bright_white) = if lightmode {
+    let (dark_black, bright_black, dark_white, bright_white) = if !lightmode {
         (
-            shade_colors[7],
-            foreground_color,
-            shade_colors[3],
             background_color,
+            shade_colors[3],
+            foreground_color,
+            shade_colors[7],
         )
     } else {
         (
-            background_color,
-            shade_colors[3],
-            foreground_color,
             shade_colors[7],
+            foreground_color,
+            shade_colors[3],
+            background_color,
         )
     };
 
@@ -420,7 +512,7 @@ fn main() {
 
     // R, G, Y, B, M, C
     let source_hues = vec![0.0, 120.0, 60.0, 240.0, 300.0, 180.0];
-    if args.verbose {
+    if verbose {
         eprintln!("Source hues: {:?}", source_hues);
     }
 
@@ -428,7 +520,7 @@ fn main() {
         .iter()
         .map(|&source_hue| extract_hue_and_weight(source_hue, &hues, &chromas, kappa_1))
         .unzip();
-    if args.verbose {
+    if verbose {
         eprintln!("Extracted hues: {:?}", extracted_hues);
         eprintln!("Weights: {:?}", weights);
     }
@@ -450,9 +542,9 @@ fn main() {
     let dominant_hue_difference =
         (dominant_hue - dominant_source_hue + 180.0).rem_euclid(360.0) - 180.0;
     let exists_dominant_hue =
-        dominant_hue_difference.abs() < args.hue_difference_threshold && dominant_weight > 1e-6;
+        dominant_hue_difference.abs() < hue_difference_threshold && dominant_weight > 1e-6;
 
-    if args.verbose {
+    if verbose {
         if exists_dominant_hue {
             eprintln!("Dominant hue: {}", dominant_hue);
             eprintln!("Dominant weight: {}", dominant_weight);
@@ -473,23 +565,23 @@ fn main() {
     )
     .map(|(&name, &source_hue, &extracted_hue, &weight)| {
         let hue_difference = (extracted_hue - source_hue + 180.0).rem_euclid(360.0) - 180.0;
-        if args.verbose {
+        if verbose {
             eprintln!("Source {} hue: {}", name, source_hue);
             eprintln!("Extracted {} hue: {}", name, extracted_hue);
             eprintln!("Hue difference: {}", hue_difference);
         }
 
         let use_refined_hue = {
-            if hue_difference.abs() < args.hue_difference_threshold {
-                if args.verbose {
+            if hue_difference.abs() < hue_difference_threshold {
+                if verbose {
                     eprintln!(
                         "{} hue difference is smaller than the threshold {}.",
-                        name, args.hue_difference_threshold
+                        name, hue_difference_threshold
                     );
                 }
                 true
             } else if weight < minimum_chroma {
-                if args.verbose {
+                if verbose {
                     eprintln!(
                         "{} hue weight is smaller than the minimum chroma {}.",
                         name, minimum_chroma
@@ -511,7 +603,7 @@ fn main() {
                     source_hue
                 }
             };
-            if args.verbose {
+            if verbose {
                 eprintln!(
                     "Using refined hue {} instead of extracted hue.",
                     refined_hue
@@ -531,7 +623,7 @@ fn main() {
                     dominant_lightness,
                 ));
                 let luminance = colors::get_relative_luminance(dominant_color);
-                if args.verbose {
+                if verbose {
                     eprintln!(
                         "Using dominant saturation {} and lightness {} for {}.",
                         dominant_saturation, dominant_lightness, name
@@ -616,7 +708,7 @@ fn main() {
             minimum_chroma,
             lightmode,
         );
-        if args.verbose {
+        if verbose {
             eprintln!("Orange hue: {}", orange_hue);
             eprintln!("Orange saturation: {}", orange_saturation);
             eprintln!("Orange lightness: {}", orange_lightness);
@@ -630,7 +722,7 @@ fn main() {
             lightmode,
         )
     };
-    let brown_luminance = shade_luminances[3];
+    let brown_luminance = shade_encoded_luminances[3];
     let brown = set_gamma_correction_encoded_luminance(orange, brown_luminance);
 
     let base16_colors = Base16Colors {
@@ -699,7 +791,7 @@ fn main() {
             ],
         ];
         let debug_image = get_debug_image(&image, &palette);
-        let debug_path = match args.debug_output.clone() {
+        let debug_path = match debug_output.clone() {
             Some(path) => path,
             None => tempfile::Builder::new()
                 .suffix(".png")
@@ -712,7 +804,7 @@ fn main() {
                 .to_string(),
         };
         debug_image.save(&debug_path).unwrap();
-        if args.debug_output == None {
+        if debug_output == None {
             open::that(&debug_path).unwrap();
         }
     }

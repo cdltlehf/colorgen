@@ -19,6 +19,7 @@ cargo install --path .
 
 ## Usage
 
+
 ```
 Usage: colorgen [OPTIONS] <IMAGE>
 
@@ -26,9 +27,6 @@ Arguments:
   <IMAGE>  
 
 Options:
-      --appearance <APPEARANCE>
-          [default: darker] [possible values: darkest, darker, dark, light,
-          lighter, lightest]
       --kappa-1 <KAPPA_1>
           Kappa parameter of the von Mises distribution for hue. The higher the
           value, the more weight will be given to hues concentrated around the
@@ -44,18 +42,28 @@ Options:
           [default: aaa] [possible values: aa, aaa]
       --minimum-chroma <MINIMUM_CHROMA>
           [default: 0.2]
-      --maximum-background-chroma <MAXIMUM_BACKGROUND_CHROMA>
-          [default: 0.2]
       --hue-difference-threshold <HUE_DIFFERENCE_THRESHOLD>
           [default: 30.0]
       --no-use-dominant-color
           Do not use the saturation and lightness of the dominant color in the
           image if the extracted hue is too far from the source hue
+      --background-color-source <BACKGROUND_COLOR_SOURCE>
+          [default: border] [possible values: border, uniform]
+      --appearance <APPEARANCE>
+          [default: dark] [possible values: dark, light, auto]
+      --maximum-dark-background-gamma-encoded-luminance <MAXIMUM_DARK_BACKGROUND_GAMMA_ENCODED_LUMINANCE>
+          [default: 0.1]
+      --minimum-light-background-gamma-encoded-luminance <MINIMUM_LIGHT_BACKGROUND_GAMMA_ENCODED_LUMINANCE>
+          [default: 0.9]
+      --maximum-dark-background-chroma <MAXIMUM_DARK_BACKGROUND_CHROMA>
+          [default: 0.05]
+      --maximum-light-background-chroma <MAXIMUM_LIGHT_BACKGROUND_CHROMA>
+          [default: 0.05]
+      --verbose
+          
       --debug
           
       --debug-output <DEBUG_OUTPUT>
-          
-      --verbose
           
   -h, --help
           Print help
