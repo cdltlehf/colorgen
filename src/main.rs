@@ -66,9 +66,9 @@ struct Args {
     maximum_dark_background_gamma_encoded_luminance: f32,
     #[clap(long, default_value = "0.9")]
     minimum_light_background_gamma_encoded_luminance: f32,
-    #[clap(long, default_value = "0.05")]
+    #[clap(long, default_value = "0.15")]
     maximum_dark_background_chroma: f32,
-    #[clap(long, default_value = "0.05")]
+    #[clap(long, default_value = "0.15")]
     maximum_light_background_chroma: f32,
 
     #[clap(long)]
